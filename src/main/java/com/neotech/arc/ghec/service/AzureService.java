@@ -4,16 +4,21 @@ import com.azure.core.management.AzureEnvironment;
 import com.azure.core.management.profile.AzureProfile;
 import com.azure.identity.DefaultAzureCredentialBuilder;
 import com.azure.resourcemanager.AzureResourceManager;
-import org.springframework.stereotype.Service;
-
 import com.azure.resourcemanager.containerservice.models.KubernetesCluster;
 import com.neotech.arc.ghec.dto.AksClusterDetailsDTO;
+import com.neotech.arc.ghec.dto.AksClusterDTO;
 import com.neotech.arc.ghec.dto.PodDTO;
-import io.fabric8.kubernetes.client.Config;
-import io.fabric8.kubernetes.client.KubernetesClient;
-import io.fabric8.kubernetes.client.KubernetesClientBuilder;
+import org.springframework.stereotype.Service;
+
+import io.kubernetes.client.openapi.ApiClient;
+import io.kubernetes.client.openapi.apis.CoreV1Api;
+import io.kubernetes.client.openapi.models.V1Pod;
+import io.kubernetes.client.openapi.models.V1PodList;
+import io.kubernetes.client.util.ClientBuilder;
+import io.kubernetes.client.util.KubeConfig;
+
+import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
-import java.util.Base64;
 import java.util.List;
 import java.util.stream.Collectors;
 
@@ -23,38 +28,31 @@ public class AzureService {
     private AzureResourceManager azureResourceManager;
 
     public AzureService() {
-        // Authenticate using DefaultAzureCredential (supports CLI, Environment, Managed
-        // Identity, etc.)
         try {
             this.azureResourceManager = AzureResourceManager.configure()
-                    .authenticate(new DefaultAzureCredentialBuilder().build(), new AzureProfile(AzureEnvironment.AZURE))
+                    .authenticate(
+                            new DefaultAzureCredentialBuilder().build(),
+                            new AzureProfile(AzureEnvironment.AZURE))
                     .withDefaultSubscription();
         } catch (Exception e) {
-            e.printStackTrace();
+            throw new RuntimeException("Failed to initialize AzureResourceManager", e);
         }
     }
 
-    /**
-     * Counts the number of AKS clusters in the default subscription.
-     *
-     * @return the number of AKS clusters.
-     */
     public int getAksClusterCount() {
-        // PagedIterable is returned, we can count them.
-        // For large numbers, this might be slow as it iterates pages, but for typical
-        // use ok.
         if (this.azureResourceManager == null) {
             return 0;
         }
-        return this.azureResourceManager.kubernetesClusters().list().stream().toList().size();
+        return (int) this.azureResourceManager.kubernetesClusters().list().stream().count();
     }
 
-    public List<com.neotech.arc.ghec.dto.AksClusterDTO> getAksClusters() {
+    public List<AksClusterDTO> getAksClusters() {
         if (this.azureResourceManager == null) {
             return List.of();
         }
+
         return this.azureResourceManager.kubernetesClusters().list().stream()
-                .map(cluster -> new com.neotech.arc.ghec.dto.AksClusterDTO(
+                .map(cluster -> new AksClusterDTO(
                         cluster.name(),
                         cluster.resourceGroupName(),
                         cluster.version(),
@@ -64,6 +62,7 @@ public class AzureService {
     }
 
     public AksClusterDetailsDTO getClusterDetails(String resourceGroup, String clusterName) {
+
         if (this.azureResourceManager == null) {
             return null;
         }
@@ -75,24 +74,35 @@ public class AzureService {
             throw new RuntimeException("Cluster not found: " + clusterName);
         }
 
-        // Get admin kubeconfig
+        // ⚠️ Admin kubeconfig (OK for now, see notes below)
         byte[] kubeConfigBytes = cluster.adminKubeConfigs().get(0).value();
         String kubeConfigContent = new String(kubeConfigBytes, StandardCharsets.UTF_8);
 
-        try (KubernetesClient client = new KubernetesClientBuilder()
-                .withConfig(Config.fromKubeconfig(kubeConfigContent))
-                .build()) {
+        try {
+            // Build Kubernetes API client from kubeconfig
+            KubeConfig kubeConfig = KubeConfig.loadKubeConfig(
+                    new StringReader(kubeConfigContent));
 
-            List<PodDTO> pods = client.pods().inAnyNamespace().list().getItems().stream()
-                    .map(pod -> new PodDTO(
-                            pod.getMetadata().getName(),
-                            pod.getMetadata().getNamespace(),
-                            pod.getStatus().getPhase(),
-                            pod.getSpec().getNodeName(),
-                            pod.getStatus().getStartTime(),
-                            pod.getStatus().getContainerStatuses().stream()
-                                    .mapToInt(status -> status.getRestartCount())
-                                    .sum()))
+            ApiClient apiClient = ClientBuilder.kubeconfig(kubeConfig).build();
+
+            CoreV1Api coreV1Api = new CoreV1Api(apiClient);
+
+            // List pods across all namespaces
+            V1PodList podList = coreV1Api.listPodForAllNamespaces(
+                    null,   // pretty
+                    null,   // allowWatchBookmarks
+                    null,   // continue
+                    null,   // fieldSelector
+                    null,   // labelSelector
+                    null,   // limit
+                    null,   // resourceVersion
+                    null,   // resourceVersionMatch
+                    null,   // timeoutSeconds
+                    false   // watch
+            );
+
+            List<PodDTO> pods = podList.getItems().stream()
+                    .map(this::toPodDTO)
                     .collect(Collectors.toList());
 
             return new AksClusterDetailsDTO(
@@ -101,7 +111,31 @@ public class AzureService {
                     cluster.version(),
                     cluster.provisioningState(),
                     cluster.agentPools().size(),
-                    pods);
+                    pods
+            );
+
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to retrieve pod details for AKS cluster", e);
         }
+    }
+
+    private PodDTO toPodDTO(V1Pod pod) {
+
+        int restartCount = 0;
+        if (pod.getStatus() != null && pod.getStatus().getContainerStatuses() != null) {
+            restartCount = pod.getStatus().getContainerStatuses()
+                    .stream()
+                    .mapToInt(cs -> cs.getRestartCount())
+                    .sum();
+        }
+
+        return new PodDTO(
+                pod.getMetadata().getName(),
+                pod.getMetadata().getNamespace(),
+                pod.getStatus() != null ? pod.getStatus().getPhase() : "Unknown",
+                pod.getSpec() != null ? pod.getSpec().getNodeName() : null,
+                pod.getStatus() != null ? pod.getStatus().toString() : null,
+                restartCount
+        );
     }
 }
